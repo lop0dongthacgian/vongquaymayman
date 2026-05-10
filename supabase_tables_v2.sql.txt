@@ -1,0 +1,416 @@
+-- ============================================================
+--  VÒNG QUAY MAY MẮN – SCHEMA V4 (HỖ TRỢ LƯU/TẢI PHIÊN)
+-- ============================================================
+
+-- ── XOÁ CŨ ────────────────────────────────────────────────
+DROP FUNCTION IF EXISTS client_request_spin(INTEGER) CASCADE;
+DROP FUNCTION IF EXISTS client_submit_answer(TEXT) CASCADE;
+DROP FUNCTION IF EXISTS host_update_game(INTEGER,INTEGER,BOOLEAN,BOOLEAN,TEXT,NUMERIC,INTEGER,INTEGER,BOOLEAN,TEXT,INTEGER,TEXT) CASCADE;
+DROP FUNCTION IF EXISTS host_update_player(INTEGER,TEXT,INTEGER,INTEGER,INTEGER,BOOLEAN) CASCADE;
+DROP FUNCTION IF EXISTS host_reset_game() CASCADE;
+DROP FUNCTION IF EXISTS host_save_session() CASCADE;
+DROP FUNCTION IF EXISTS host_load_session(INTEGER) CASCADE;
+DROP TABLE IF EXISTS spin_history CASCADE;
+DROP TABLE IF EXISTS players CASCADE;
+DROP TABLE IF EXISTS game_state CASCADE;
+DROP TABLE IF EXISTS session_history CASCADE;
+
+-- ── BẢNG game_state ─────────────────────────────────────────
+CREATE TABLE game_state (
+    id             INTEGER  PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    reset_token    INTEGER  NOT NULL DEFAULT 0,
+    total_players  INTEGER  NOT NULL DEFAULT 0,
+    current_player INTEGER  NOT NULL DEFAULT 0,
+    started        BOOLEAN  NOT NULL DEFAULT FALSE,
+    spinning       BOOLEAN  NOT NULL DEFAULT FALSE,
+    spin_result    TEXT     NOT NULL DEFAULT '',
+    spin_angle     NUMERIC  NOT NULL DEFAULT 0,
+    spin_counter   INTEGER  NOT NULL DEFAULT 0,
+    question_id    INTEGER  NOT NULL DEFAULT 0,
+    waiting_answer BOOLEAN  NOT NULL DEFAULT FALSE,
+    answer_result  TEXT     NOT NULL DEFAULT '',
+    request_spin   INTEGER  NOT NULL DEFAULT 0,
+    host_phase     TEXT     NOT NULL DEFAULT 'idle',
+    package_type   TEXT     NOT NULL DEFAULT 'balanced',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO game_state (id) VALUES (1);
+
+-- ── BẢNG players ────────────────────────────────────────────
+CREATE TABLE players (
+    id         INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND 6),
+    name       TEXT    NOT NULL DEFAULT '',
+    score      INTEGER NOT NULL DEFAULT 0,
+    turns_left INTEGER NOT NULL DEFAULT 0,
+    spin_count INTEGER NOT NULL DEFAULT 0,
+    online     BOOLEAN NOT NULL DEFAULT FALSE,
+    joined_at  TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO players (id) VALUES (1),(2),(3),(4),(5),(6);
+
+-- ── BẢNG spin_history ───────────────────────────────────────
+CREATE TABLE spin_history (
+    id           SERIAL      PRIMARY KEY,
+    player_id    INTEGER     NOT NULL REFERENCES players(id),
+    result       TEXT        NOT NULL DEFAULT '',
+    answered     TEXT        NOT NULL DEFAULT '',
+    score_change INTEGER     NOT NULL DEFAULT 0,
+    turns_change INTEGER     NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ── BẢNG session_history ────────────────────────────────────
+CREATE TABLE session_history (
+    id              SERIAL      PRIMARY KEY,
+    session_data    JSONB       NOT NULL,
+    total_players   INTEGER     NOT NULL,
+    winner_name     TEXT,
+    winner_score    INTEGER,
+    ended_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ── FUNCTION: tự động cập nhật updated_at ───────────────────
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER update_game_state_updated_at
+    BEFORE UPDATE ON game_state
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_players_updated_at
+    BEFORE UPDATE ON players
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ── RLS ─────────────────────────────────────────────────────
+ALTER TABLE game_state   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE players      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE spin_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE session_history ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "allow_all_anon" ON game_state FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_anon" ON players FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_anon" ON spin_history FOR ALL TO anon USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_anon" ON session_history FOR ALL TO anon USING (true) WITH CHECK (true);
+
+-- ── FUNCTIONS ──────────────────────────────────────────────
+
+-- 1. Client yêu cầu quay
+CREATE OR REPLACE FUNCTION client_request_spin(p_player_id INTEGER)
+RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+    v_started        BOOLEAN;
+    v_current_player INTEGER;
+    v_spinning       BOOLEAN;
+    v_waiting_answer BOOLEAN;
+    v_request_spin   INTEGER;
+    v_host_phase     TEXT;
+    v_turns_left     INTEGER;
+    v_online         BOOLEAN;
+BEGIN
+    -- Check if player exists and is online
+    SELECT online, turns_left 
+    INTO v_online, v_turns_left 
+    FROM players 
+    WHERE id = p_player_id;
+    
+    IF NOT v_online OR v_turns_left <= 0 THEN
+        RETURN FALSE;
+    END IF;
+    
+    SELECT started, current_player, spinning, waiting_answer, request_spin, host_phase
+    INTO v_started, v_current_player, v_spinning, v_waiting_answer, v_request_spin, v_host_phase
+    FROM game_state WHERE id = 1;
+    
+    IF  v_started
+    AND v_current_player = p_player_id
+    AND NOT v_spinning    AND NOT v_waiting_answer
+    AND v_request_spin = 0
+    AND v_host_phase IN ('playing','idle')
+    AND v_turns_left > 0
+    THEN
+        UPDATE game_state SET request_spin = p_player_id WHERE id = 1;
+        RETURN TRUE;
+    END IF;
+    
+    RETURN FALSE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION client_request_spin(INTEGER) TO anon;
+
+-- 2. Client gửi đáp án
+CREATE OR REPLACE FUNCTION client_submit_answer(p_result TEXT)
+RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+    v_waiting_answer BOOLEAN;
+    v_answer_result  TEXT;
+BEGIN
+    IF p_result NOT IN ('correct','wrong') THEN 
+        RETURN FALSE; 
+    END IF;
+    
+    SELECT waiting_answer, answer_result
+    INTO v_waiting_answer, v_answer_result
+    FROM game_state WHERE id = 1;
+    
+    IF v_waiting_answer AND v_answer_result = '' THEN
+        UPDATE game_state SET answer_result = p_result, waiting_answer = FALSE WHERE id = 1;
+        RETURN TRUE;
+    END IF;
+    
+    RETURN FALSE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION client_submit_answer(TEXT) TO anon;
+
+-- 3. Host cập nhật game_state
+CREATE OR REPLACE FUNCTION host_update_game(
+    p_total_players  INTEGER DEFAULT NULL,
+    p_current_player INTEGER DEFAULT NULL,
+    p_started        BOOLEAN DEFAULT NULL,
+    p_spinning       BOOLEAN DEFAULT NULL,
+    p_spin_result    TEXT    DEFAULT NULL,
+    p_spin_angle     NUMERIC DEFAULT NULL,
+    p_spin_counter   INTEGER DEFAULT NULL,
+    p_question_id    INTEGER DEFAULT NULL,
+    p_waiting_answer BOOLEAN DEFAULT NULL,
+    p_answer_result  TEXT    DEFAULT NULL,
+    p_request_spin   INTEGER DEFAULT NULL,
+    p_host_phase     TEXT    DEFAULT NULL,
+    p_package_type   TEXT    DEFAULT NULL
+) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    UPDATE game_state SET
+        total_players  = COALESCE(p_total_players,  total_players),
+        current_player = COALESCE(p_current_player, current_player),
+        started        = COALESCE(p_started,        started),
+        spinning       = COALESCE(p_spinning,       spinning),
+        spin_result    = COALESCE(p_spin_result,    spin_result),
+        spin_angle     = COALESCE(p_spin_angle,     spin_angle),
+        spin_counter   = COALESCE(p_spin_counter,   spin_counter),
+        question_id    = COALESCE(p_question_id,    question_id),
+        waiting_answer = COALESCE(p_waiting_answer, waiting_answer),
+        answer_result  = COALESCE(p_answer_result,  answer_result),
+        request_spin   = COALESCE(p_request_spin,   request_spin),
+        host_phase     = COALESCE(p_host_phase,     host_phase),
+        package_type   = COALESCE(p_package_type,   package_type)
+    WHERE id = 1;
+    
+    RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION host_update_game(INTEGER,INTEGER,BOOLEAN,BOOLEAN,TEXT,NUMERIC,INTEGER,INTEGER,BOOLEAN,TEXT,INTEGER,TEXT,TEXT) TO anon;
+
+-- 4. Host cập nhật player
+CREATE OR REPLACE FUNCTION host_update_player(
+    p_id         INTEGER,
+    p_name       TEXT    DEFAULT NULL,
+    p_score      INTEGER DEFAULT NULL,
+    p_turns_left INTEGER DEFAULT NULL,
+    p_spin_count INTEGER DEFAULT NULL,
+    p_online     BOOLEAN DEFAULT NULL
+) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    UPDATE players SET
+        name       = COALESCE(p_name,       name),
+        score      = COALESCE(p_score,      score),
+        turns_left = COALESCE(p_turns_left, turns_left),
+        spin_count = COALESCE(p_spin_count, spin_count),
+        online     = COALESCE(p_online,     online),
+        joined_at  = CASE 
+                        WHEN p_online = TRUE AND online = FALSE THEN NOW()
+                        ELSE joined_at
+                     END
+    WHERE id = p_id;
+    
+    RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION host_update_player(INTEGER,TEXT,INTEGER,INTEGER,INTEGER,BOOLEAN) TO anon;
+
+-- 5. Host ghi nhận lượt quay vào lịch sử
+CREATE OR REPLACE FUNCTION host_record_spin(
+    p_player_id    INTEGER,
+    p_result       TEXT,
+    p_answered     TEXT,
+    p_score_change INTEGER,
+    p_turns_change INTEGER
+) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    INSERT INTO spin_history (player_id, result, answered, score_change, turns_change)
+    VALUES (p_player_id, p_result, p_answered, p_score_change, p_turns_change);
+    
+    RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION host_record_spin(INTEGER,TEXT,TEXT,INTEGER,INTEGER) TO anon;
+
+-- 6. Host lưu session kết thúc
+CREATE OR REPLACE FUNCTION host_save_session()
+RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+    v_session_data JSONB;
+    v_total_players INTEGER;
+    v_winner_name TEXT;
+    v_winner_score INTEGER;
+BEGIN
+    -- Lấy dữ liệu game state
+    SELECT jsonb_build_object(
+        'game_state', row_to_json(gs),
+        'players', (SELECT jsonb_agg(row_to_json(p)) FROM players p)
+    ) INTO v_session_data
+    FROM game_state gs
+    WHERE id = 1;
+    
+    -- Lấy tổng số người chơi
+    SELECT total_players INTO v_total_players FROM game_state WHERE id = 1;
+    
+    -- Tìm người thắng cuộc
+    SELECT name, score INTO v_winner_name, v_winner_score
+    FROM players
+    WHERE id <= v_total_players
+    ORDER BY score DESC, turns_left DESC
+    LIMIT 1;
+    
+    -- Lưu vào lịch sử
+    INSERT INTO session_history (session_data, total_players, winner_name, winner_score)
+    VALUES (v_session_data, v_total_players, v_winner_name, v_winner_score);
+    
+    RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION host_save_session() TO anon;
+
+-- 7. Host reset game - XOÁ SẠCH HOÀN TOÀN
+CREATE OR REPLACE FUNCTION host_reset_game()
+RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    -- Lưu session hiện tại trước khi reset (nếu có game)
+    IF EXISTS (SELECT 1 FROM game_state WHERE total_players > 0 AND started = TRUE) THEN
+        PERFORM host_save_session();
+    END IF;
+    
+    -- Reset game state - QUAN TRỌNG: xoá tất cả về mặc định
+    UPDATE game_state SET
+        reset_token    = reset_token + 1,
+        total_players  = 0,
+        current_player = 0,
+        started        = FALSE,
+        spinning       = FALSE,
+        spin_result    = '',
+        spin_angle     = 0,
+        spin_counter   = 0,
+        question_id    = 0,
+        waiting_answer = FALSE,
+        answer_result  = '',
+        request_spin   = 0,
+        host_phase     = 'idle',
+        package_type   = 'balanced'
+    WHERE id = 1;
+    
+    -- Reset ALL players - XOÁ HOÀN TOÀN
+    UPDATE players SET 
+        name = '', 
+        score = 0, 
+        turns_left = 0, 
+        spin_count = 0, 
+        online = FALSE,
+        joined_at = NULL
+    WHERE id <= 6;
+    
+    -- Giữ lại lịch sử để thống kê, không xoá
+    -- DELETE FROM spin_history; -- COMMENT: Giữ lại để thống kê
+    
+    RETURN TRUE;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION host_reset_game() TO anon;
+
+-- 8. Host lấy thống kê phiên
+CREATE OR REPLACE FUNCTION host_get_session_stats()
+RETURNS TABLE (
+    total_sessions   BIGINT,
+    last_session     JSONB,
+    most_winner      TEXT,
+    avg_score        NUMERIC
+) LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    RETURN QUERY
+    WITH stats AS (
+        SELECT 
+            COUNT(*) as session_count,
+            AVG(winner_score) as avg_winner_score,
+            (SELECT jsonb_build_object(
+                'id', id,
+                'winner', winner_name,
+                'score', winner_score,
+                'ended_at', ended_at
+            ) FROM session_history ORDER BY id DESC LIMIT 1) as last,
+            (SELECT winner_name FROM session_history 
+             GROUP BY winner_name ORDER BY COUNT(*) DESC LIMIT 1) as top_winner
+        FROM session_history
+    )
+    SELECT 
+        session_count,
+        last,
+        top_winner,
+        ROUND(COALESCE(avg_winner_score, 0), 2)
+    FROM stats;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION host_get_session_stats() TO anon;
+
+-- ── Realtime ─────────────────────────────────────────────────
+ALTER TABLE game_state   REPLICA IDENTITY FULL;
+ALTER TABLE players      REPLICA IDENTITY FULL;
+ALTER TABLE spin_history REPLICA IDENTITY FULL;
+
+-- Thêm vào publication realtime
+ALTER PUBLICATION supabase_realtime ADD TABLE game_state;
+ALTER PUBLICATION supabase_realtime ADD TABLE players;
+ALTER PUBLICATION supabase_realtime ADD TABLE spin_history;
+
+-- ── Indexes cho hiệu suất ───────────────────────────────────
+CREATE INDEX idx_spin_history_player_id ON spin_history(player_id);
+CREATE INDEX idx_spin_history_created_at ON spin_history(created_at DESC);
+CREATE INDEX idx_session_history_ended_at ON session_history(ended_at DESC);
+CREATE INDEX idx_players_online ON players(online) WHERE online = TRUE;
+
+-- ── Trigger đảm bảo chỉ có 1 dòng trong game_state ─────────
+CREATE OR REPLACE FUNCTION prevent_extra_game_state()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF (SELECT COUNT(*) FROM game_state) > 1 THEN
+        DELETE FROM game_state WHERE id != 1;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER keep_single_game_state
+    AFTER INSERT ON game_state
+    FOR EACH ROW EXECUTE FUNCTION prevent_extra_game_state();
+
+-- ── Thêm comment cho dễ hiểu ────────────────────────────────
+COMMENT ON TABLE game_state IS 'Trạng thái hiện tại của game';
+COMMENT ON TABLE players IS 'Thông tin người chơi';
+COMMENT ON TABLE spin_history IS 'Lịch sử các lượt quay';
+COMMENT ON TABLE session_history IS 'Lịch sử các phiên game đã kết thúc';
+COMMENT ON COLUMN game_state.package_type IS 'Loại gói quay: balanced, adventurous, easy';
+COMMENT ON COLUMN players.joined_at IS 'Thời gian người chơi vào phòng gần nhất';
